@@ -7,6 +7,8 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # PCL 라이브러리 찾기
 find_package(PCL REQUIRED)
+find_package(PCL REQUIRED COMPONENTS common io visualization)
+find_package(OpenMP REQUIRED)  # OpenMP 패키지 찾기
 
 # 헤더 파일 경로 추가
 include_directories(
@@ -28,4 +30,5 @@ add_executable(get_pcd
 # PCL 라이브러리 링크
 target_link_libraries(get_pcd
     ${PCL_LIBRARIES}
+    OpenMP::OpenMP_CXX  # OpenMP 라이브러리 링크
 )
