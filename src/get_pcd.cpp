@@ -8,16 +8,24 @@
 #include <numeric>
 #include <cmath>
 
-// 변환 행렬 비교 함수
-bool compareTransformations(const Eigen::Matrix4f& T1, const Eigen::Matrix4f& T2, float threshold = 0.5) {
-    // 회전 부분과 이동 부분의 차이 계산
-    float rotation_diff = (T1.block<3,3>(0,0) - T2.block<3,3>(0,0)).norm();
-    float translation_diff = (T1.block<3,1>(0,3) - T2.block<3,1>(0,3)).norm();
+struct TransformationError {
+    float rotation_error;
+    float translation_error;
+};
+
+inline TransformationError compareTransformations(const Eigen::Matrix4f& T1, const Eigen::Matrix4f& T2) {
+    // 회전 오차 계산 (Frobenius norm을 사용하여 회전 행렬 차이를 계산)
+    Eigen::Matrix3f R1 = T1.block<3,3>(0,0);
+    Eigen::Matrix3f R2 = T2.block<3,3>(0,0);
+    Eigen::Matrix3f R_diff = R1 * R2.transpose() - Eigen::Matrix3f::Identity();
+    float rotation_diff = R_diff.norm() * 180.0 / M_PI;  // 각도로 변환 (도)
+
+    // 이동 오차 계산 (Euclidean distance)
+    Eigen::Vector3f t1 = T1.block<3,1>(0,3);
+    Eigen::Vector3f t2 = T2.block<3,1>(0,3);
+    float translation_diff = (t1 - t2).norm(); 
     
-    std::cout << "Rotation difference: " << rotation_diff << std::endl;
-    std::cout << "Translation difference: " << translation_diff << std::endl;
-    
-    return rotation_diff < threshold && translation_diff < threshold;
+    return {rotation_diff, translation_diff};
 }
 
 int main() {
@@ -36,53 +44,78 @@ int main() {
     // Pose transformation 예시
     // frame 0과 frame 5 사이의 transformation matrix 가져오기
     //Eigen::Matrix4f transform = reader.getTransformation(0, 5);
+
     
-    std::vector<float> mean_time;
-    std::vector<bool> results_match;
+    std::vector<TransformationError> error_history;
+    float total_rotation_error = 0.0f;
+    float total_translation_error = 0.0f;
+
+    //이전 프레임 변환 행렬 저장 공유 메모리
+    Eigen::Matrix4f serial_transform = Eigen::Matrix4f::Identity();
+    Eigen::Matrix4f parallel_transform = Eigen::Matrix4f::Identity();
 
     for (int i = 0; i < 4540; i++) {
         pcl::PointCloud<pcl::PointXYZI>::Ptr cloud1 = reader.getFrame(i);
         pcl::PointCloud<pcl::PointXYZI>::Ptr cloud2 = reader.getFrame(i+1);
+        Eigen::Matrix4f gt_transform = reader.getTransformation(i, i+1);
 
         /////////////////////////////////////////// ICP 매칭 ///////////////////////////////////////////
         SerialICP serial_icp;
-        ParallelICP parallel_icp;
         int64_t computation_time;
-        int64_t parallel_computation_time;
+
+        // ParallelICP parallel_icp;
+        // int64_t parallel_computation_time;
         
         // Serial ICP 매칭 수행
-        Eigen::Matrix4f serial_transform = serial_icp.align(cloud1, cloud2, computation_time);
+        serial_transform = serial_icp.align(cloud1, cloud2, serial_transform, computation_time);
         std::cout << "[Frame " << i << "] Serial ICP 매칭 소요 시간: " << computation_time << "ms" << std::endl;
         
         // Parallel ICP 매칭 수행
-        Eigen::Matrix4f parallel_transform = parallel_icp.align(cloud1, cloud2, parallel_computation_time);
-        std::cout << "[Frame " << i << "] Parallel ICP 매칭 소요 시간: " << parallel_computation_time << "ms" << std::endl;
+        // Eigen::Matrix4f parallel_transform = parallel_icp.align(cloud1, cloud2, parallel_transform, parallel_computation_time);
+        // std::cout << "[Frame " << i << "] Parallel ICP 매칭 소요 시간: " << parallel_computation_time << "ms" << std::endl;
 
-        // 결과 비교
-        bool match = compareTransformations(serial_transform, parallel_transform);
-        results_match.push_back(match);
-        std::cout << "[Frame " << i << "] Results match: " << (match ? "Yes" : "No") << std::endl;
+        // 최종 변환 결과와 ground truth 비교
+        TransformationError errors = compareTransformations(gt_transform, serial_transform);
+        error_history.push_back(errors);
         
-        // 변환 행렬 출력
-        std::cout << "\nSerial Transform:\n" << serial_transform << std::endl;
+        // 현재까지의 평균 에러 계산
+        total_rotation_error += errors.rotation_error;
+        total_translation_error += errors.translation_error;
+        float avg_rotation_error = total_rotation_error / (i + 1);
+        float avg_translation_error = total_translation_error / (i + 1);
+
+        std::cout << "[Frame " << i << "] Current Errors - Rotation: " << errors.rotation_error 
+                  << ", Translation: " << errors.translation_error << std::endl;
+        std::cout << "[Frame " << i << "] Average Errors - Rotation: " << avg_rotation_error 
+                  << ", Translation: " << avg_translation_error << std::endl;
+        std::cout << "-------------------------------------------" << std::endl;
+
+        //================================ 시간 비교 =================================
+        // // 결과 비교
+        // bool match = compareTransformations(serial_transform, parallel_transform);
+        // results_match.push_back(match);
+        // std::cout << "[Frame " << i << "] Results match: " << (match ? "Yes" : "No") << std::endl;
+        
+        // // 변환 행렬 출력
+        // std::cout << "\nSerial Transform:\n" << serial_transform << std::endl;
         std::cout << "\nParallel Transform:\n" << parallel_transform << std::endl;
 
         // 가속화 계산
-        float speedup = static_cast<float>(computation_time) / parallel_computation_time;
-        std::cout << "[Frame " << i << "] Speedup: " << speedup << "x" << std::endl;
-        mean_time.push_back(speedup);
+        // float speedup = static_cast<float>(computation_time) / parallel_computation_time;
+        // std::cout << "[Frame " << i << "] Speedup: " << speedup << "x" << std::endl;
+        // mean_time.push_back(speedup);
         
-        std::cout << "-------------------------------------------" << std::endl;
+        // std::cout << "-------------------------------------------" << std::endl;
     }
     
     // 최종 통계 출력
-    float mean_speedup = std::accumulate(mean_time.begin(), mean_time.end(), 0.0f) / mean_time.size();
-    int match_count = std::count(results_match.begin(), results_match.end(), true);
+    // float mean_speedup = std::accumulate(mean_time.begin(), mean_time.end(), 0.0f) / mean_time.size();
+    // int match_count = std::count(results_match.begin(), results_match.end(), true);
     
-    std::cout << "\n=== Final Statistics ===" << std::endl;
-    std::cout << "Average speedup: " << mean_speedup << "x" << std::endl;
-    std::cout << "Matching results: " << match_count << "/" << results_match.size() 
-              << " (" << (float)match_count/results_match.size()*100 << "%)" << std::endl;
+    // std::cout << "\n=== Final Statistics ===" << std::endl;
+    // std::cout << "Average speedup: " << mean_speedup << "x" << std::endl;
+    // std::cout << "Matching results: " << match_count << "/" << results_match.size() 
+    //           << " (" << (float)match_count/results_match.size()*100 << "%)" << std::endl;
 
     /////////////////////////////////////////// 시각화 ///////////////////////////////////////////
 
