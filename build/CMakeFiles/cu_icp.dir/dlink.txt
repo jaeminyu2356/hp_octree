@@ -1,0 +1,1 @@
+/usr/bin/nvcc -forward-unknown-to-host-compiler  -arch=sm_60 -Xcompiler=-fPIC -Wno-deprecated-gpu-targets -shared -dlink -o CMakeFiles/cu_icp.dir/cmake_device_link.o  libcu_icp_kernels.a  -ldl -llz4 -lcudadevrt -lcudart_static -lrt -lpthread 

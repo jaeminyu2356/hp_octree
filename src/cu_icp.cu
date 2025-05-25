@@ -1,438 +1,315 @@
+#include "cu_icp.cuh"
 #include <cuda_runtime.h>
-#include <device_launch_parameters.h>
-#include <pcl/io/pcd_io.h>
-#include <pcl/point_types.h>
-#include <Eigen/Dense>
-#include <cusolverDn.h>
-#include <vector>
+#include <thrust/device_vector.h>
+#include <thrust/host_vector.h>
+#include <omp.h>
+#include <queue>
+#include <mutex>
+#include <condition_variable>
+#include <thread>
 
-// CUDA kernel for computing nearest neighbors
-__global__ void findNearestNeighborsKernel(
-    const float* source_points,
-    const float* target_points,
-    int* correspondences,
-    float* distances,
-    const int num_source,
-    const int num_target
-) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= num_source) return;
+CU_ICP::CU_ICP(const ICPParams& params) : params(params), processing_complete(false) {
+    initializeStreams();
+}
 
-    float min_dist = INFINITY;
-    int best_match = -1;
+CU_ICP::~CU_ICP() {
+    // GPU 스레드 정리
+    {
+        std::lock_guard<std::mutex> lock(queue_mutex);
+        processing_complete = true;
+    }
+    queue_cv.notify_all();
+    if (gpu_thread.joinable()) {
+        gpu_thread.join();
+    }
     
-    float src_x = source_points[idx * 4];
-    float src_y = source_points[idx * 4 + 1];
-    float src_z = source_points[idx * 4 + 2];
+    cleanupStreams();
+}
 
-    for (int j = 0; j < num_target; j++) {
-        float tgt_x = target_points[j * 4];
-        float tgt_y = target_points[j * 4 + 1];
-        float tgt_z = target_points[j * 4 + 2];
+void CU_ICP::initializeStreams() {
+    for (int i = 0; i < HardwareParams::NUM_STREAMS; ++i) {
+        StreamContext ctx;
+        ctx.is_busy = false;
+        CUDA_CHECK(cudaStreamCreateWithFlags(&ctx.stream, cudaStreamNonBlocking));
+        CUDA_CHECK(cudaEventCreateWithFlags(&ctx.compute_complete, cudaEventDisableTiming));
+        CUDA_CHECK(cudaEventCreateWithFlags(&ctx.transfer_complete, cudaEventDisableTiming));
+        
+        // 페이지 고정 호스트 메모리 할당
+        CUDA_CHECK(cudaMallocHost(&ctx.pinned_host_buffer, 
+                                 HardwareParams::CHUNK_SIZE * sizeof(float)));
+        
+        // 디바이스 메모리 할당
+        CUDA_CHECK(cudaMalloc(&ctx.device_buffer, 
+                             HardwareParams::CHUNK_SIZE * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&ctx.d_correspondences, 
+                             HardwareParams::CHUNK_SIZE * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&ctx.d_transformation, 
+                             16 * sizeof(float)));
+        
+        stream_contexts.push_back(ctx);
+    }
+}
 
-        float dx = src_x - tgt_x;
-        float dy = src_y - tgt_y;
-        float dz = src_z - tgt_z;
-        
-        float dist = dx*dx + dy*dy + dz*dz;
-        
-        if (dist < min_dist) {
-            min_dist = dist;
-            best_match = j;
+void CU_ICP::cleanupStreams() {
+    for (auto& ctx : stream_contexts) {
+        CUDA_CHECK(cudaStreamDestroy(ctx.stream));
+        CUDA_CHECK(cudaEventDestroy(ctx.compute_complete));
+        CUDA_CHECK(cudaEventDestroy(ctx.transfer_complete));
+        CUDA_CHECK(cudaFreeHost(ctx.pinned_host_buffer));
+        CUDA_CHECK(cudaFree(ctx.device_buffer));
+        CUDA_CHECK(cudaFree(ctx.d_correspondences));
+        CUDA_CHECK(cudaFree(ctx.d_transformation));
+    }
+    stream_contexts.clear();
+}
+
+void CU_ICP::setInputSource(const pcl::PointCloud<pcl::PointXYZ>::Ptr& cloud) {
+    source_cloud = cloud;
+    num_points = cloud->points.size();
+    
+    // 전역 소스 포인트클라우드 메모리 할당
+    CUDA_CHECK(cudaMalloc(&d_source_global, 
+                         num_points * sizeof(float) * 3));
+    
+    // 데이터 전송
+    CUDA_CHECK(cudaMemcpy(d_source_global, 
+                         cloud->points.data(), 
+                         num_points * sizeof(float) * 3, 
+                         cudaMemcpyHostToDevice));
+    
+    // 청크 수 계산
+    num_chunks = (num_points * sizeof(float) * 3 + HardwareParams::CHUNK_SIZE - 1) 
+                 / HardwareParams::CHUNK_SIZE;
+}
+
+void CU_ICP::setInputTarget(const pcl::PointCloud<pcl::PointXYZ>::Ptr& cloud) {
+    target_cloud = cloud;
+    
+    // 타겟 포인트클라우드 메모리 할당 및 전송
+    CUDA_CHECK(cudaMalloc(&d_target_global, 
+                         cloud->points.size() * sizeof(float) * 3));
+    CUDA_CHECK(cudaMemcpy(d_target_global, 
+                         cloud->points.data(), 
+                         cloud->points.size() * sizeof(float) * 3, 
+                         cudaMemcpyHostToDevice));
+}
+
+__global__ void CU_ICP::kernelNearestNeighborSearch(
+    const float* __restrict__ source,
+    const float* __restrict__ target,
+    float* __restrict__ correspondences,
+    const int num_points,
+    const float max_distance
+) {
+    __shared__ float shared_target[256 * 3];  // L1 캐시 활용
+    
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= num_points) return;
+    
+    // 소스 포인트 로드
+    float sx = source[tid * 3];
+    float sy = source[tid * 3 + 1];
+    float sz = source[tid * 3 + 2];
+    
+    float min_dist = max_distance;
+    int min_idx = -1;
+    
+    // 타겟 포인트클라우드와 비교
+    for (int i = 0; i < num_points; i += blockDim.x) {
+        // 공유 메모리에 타겟 포인트 로드
+        if (i + threadIdx.x < num_points) {
+            shared_target[threadIdx.x * 3] = target[(i + threadIdx.x) * 3];
+            shared_target[threadIdx.x * 3 + 1] = target[(i + threadIdx.x) * 3 + 1];
+            shared_target[threadIdx.x * 3 + 2] = target[(i + threadIdx.x) * 3 + 2];
         }
-    }
-
-    correspondences[idx] = best_match;
-    distances[idx] = min_dist;
-}
-
-// CUDA kernel for computing point-to-point error
-__global__ void computeTransformationKernel(
-    const float* source_points,
-    const float* target_points,
-    const int* correspondences,
-    float* centroids,
-    float* covariance,
-    const int num_points
-) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= num_points) return;
-
-    int corr_idx = correspondences[idx];
-    if (corr_idx < 0) return;
-
-    // Load source point
-    float sx = source_points[idx * 4];
-    float sy = source_points[idx * 4 + 1];
-    float sz = source_points[idx * 4 + 2];
-
-    // Load target point
-    float tx = target_points[corr_idx * 4];
-    float ty = target_points[corr_idx * 4 + 1];
-    float tz = target_points[corr_idx * 4 + 2];
-
-    // Atomic add to compute centroids
-    atomicAdd(&centroids[0], sx);
-    atomicAdd(&centroids[1], sy);
-    atomicAdd(&centroids[2], sz);
-    atomicAdd(&centroids[3], tx);
-    atomicAdd(&centroids[4], ty);
-    atomicAdd(&centroids[5], tz);
-
-    // Compute contribution to covariance matrix
-    float cov[9];
-    cov[0] = sx * tx; cov[1] = sx * ty; cov[2] = sx * tz;
-    cov[3] = sy * tx; cov[4] = sy * ty; cov[5] = sy * tz;
-    cov[6] = sz * tx; cov[7] = sz * ty; cov[8] = sz * tz;
-
-    for (int i = 0; i < 9; i++) {
-        atomicAdd(&covariance[i], cov[i]);
-    }
-}
-
-// CUDA kernel for parallel reduction
-__global__ void reduceSum(float* input, float* output, int N) {
-    extern __shared__ float sdata[];
-    
-    unsigned int tid = threadIdx.x;
-    unsigned int i = blockIdx.x * blockDim.x * 2 + threadIdx.x;
-    
-    sdata[tid] = 0;
-    
-    if (i < N) {
-        sdata[tid] = input[i];
-        if (i + blockDim.x < N) 
-            sdata[tid] += input[i + blockDim.x];
-    }
-    __syncthreads();
-    
-    for (unsigned int s = blockDim.x/2; s > 0; s >>= 1) {
-        if (tid < s) {
-            sdata[tid] += sdata[tid + s];
+        __syncthreads();
+        
+        // 최근접 포인트 검색
+        for (int j = 0; j < blockDim.x && i + j < num_points; ++j) {
+            float tx = shared_target[j * 3];
+            float ty = shared_target[j * 3 + 1];
+            float tz = shared_target[j * 3 + 2];
+            
+            float dx = sx - tx;
+            float dy = sy - ty;
+            float dz = sz - tz;
+            float dist = dx * dx + dy * dy + dz * dz;
+            
+            if (dist < min_dist) {
+                min_dist = dist;
+                min_idx = i + j;
+            }
         }
         __syncthreads();
     }
     
-    if (tid == 0) output[blockIdx.x] = sdata[0];
-}
-
-// CUDA kernel for transforming points
-__global__ void transformPointsKernel(
-    float* points,
-    const float* transform,
-    int num_points
-) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= num_points) return;
-
-    float x = points[idx * 4];
-    float y = points[idx * 4 + 1];
-    float z = points[idx * 4 + 2];
-    float w = 1.0f;
-
-    float new_x = transform[0] * x + transform[4] * y + transform[8] * z + transform[12] * w;
-    float new_y = transform[1] * x + transform[5] * y + transform[9] * z + transform[13] * w;
-    float new_z = transform[2] * x + transform[6] * y + transform[10] * z + transform[14] * w;
-
-    points[idx * 4] = new_x;
-    points[idx * 4 + 1] = new_y;
-    points[idx * 4 + 2] = new_z;
-}
-
-// CUDA kernel for splitting point cloud into chunks
-__global__ void splitPointCloudKernel(
-    const float* source_points,
-    float* chunk_points,
-    const int* chunk_offsets,
-    const int chunk_size,
-    const int num_points
-) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= num_points) return;
-
-    int chunk_idx = idx / chunk_size;
-    int local_idx = idx % chunk_size;
-    int chunk_offset = chunk_offsets[chunk_idx];
-
-    // Copy point to its chunk position
-    for (int i = 0; i < 4; i++) {
-        chunk_points[chunk_offset * 4 + local_idx * 4 + i] = source_points[idx * 4 + i];
+    // 대응점 저장
+    if (min_idx >= 0) {
+        correspondences[tid * 3] = target[min_idx * 3];
+        correspondences[tid * 3 + 1] = target[min_idx * 3 + 1];
+        correspondences[tid * 3 + 2] = target[min_idx * 3 + 2];
     }
 }
 
-// CUDA kernel for averaging transforms
-__global__ void averageTransformsKernel(
-    const float* transforms,
-    float* avg_transform,
-    const int num_transforms
-) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= 16) return;  // 4x4 matrix elements
+void CU_ICP::processPointCloudAsync() {
+    const int num_cpu_threads = omp_get_max_threads();
+    std::vector<ChunkData> cpu_chunks(num_cpu_threads);
+    
+    // CPU에서 OpenMP를 사용한 청크 분할
+    #pragma omp parallel
+    {
+        int thread_id = omp_get_thread_num();
+        size_t points_per_thread = num_points / num_cpu_threads;
+        size_t start_idx = thread_id * points_per_thread;
+        size_t end_idx = (thread_id == num_cpu_threads - 1) ? 
+                        num_points : start_idx + points_per_thread;
 
-    float sum = 0.0f;
-    for (int i = 0; i < num_transforms; i++) {
-        sum += transforms[i * 16 + idx];
-    }
-    avg_transform[idx] = sum / num_transforms;
-}
+        ChunkData& chunk = cpu_chunks[thread_id];
+        chunk.start_idx = start_idx;
+        chunk.num_points = end_idx - start_idx;
+        chunk.points.resize(chunk.num_points * 3);
 
-class CUICP {
-public:
-    CUICP() : max_iterations_(50), distance_threshold_(0.05), min_points_per_chunk_(1000) {
-        cudaMalloc(&d_temp_storage_, sizeof(float) * 1024);  // For reduction
-        cusolverDnCreate(&cusolver_handle_);
-    }
-
-    ~CUICP() {
-        if (cusolver_handle_) cusolverDnDestroy(cusolver_handle_);
-        cudaFree(d_temp_storage_);
-    }
-
-    void setMaxIterations(int max_iter) { max_iterations_ = max_iter; }
-    void setDistanceThreshold(float threshold) { distance_threshold_ = threshold; }
-    void setMinPointsPerChunk(int min_points) { min_points_per_chunk_ = min_points; }
-
-    Eigen::Matrix4f align(pcl::PointCloud<pcl::PointXYZI>::Ptr source,
-                         pcl::PointCloud<pcl::PointXYZI>::Ptr target) {
-        int num_source = source->size();
-        int num_target = target->size();
-
-        // Calculate optimal number of chunks
-        int num_chunks = std::max(1, num_source / min_points_per_chunk_);
-        int chunk_size = (num_source + num_chunks - 1) / num_chunks;
-
-        // Allocate device memory for all chunks
-        float *d_source_points, *d_target_points;
-        float *d_chunk_points;  // Buffer for chunk points
-        int *d_chunk_offsets;   // Offset for each chunk
-        float *d_chunk_transforms;  // Transforms for each chunk
-
-        cudaMalloc(&d_source_points, num_source * 4 * sizeof(float));
-        cudaMalloc(&d_target_points, num_target * 4 * sizeof(float));
-        cudaMalloc(&d_chunk_points, num_source * 4 * sizeof(float));
-        cudaMalloc(&d_chunk_offsets, num_chunks * sizeof(int));
-        cudaMalloc(&d_chunk_transforms, num_chunks * 16 * sizeof(float));
-
-        // Copy point clouds to device
-        copyPointCloudToDevice(source, d_source_points, num_source);
-        copyPointCloudToDevice(target, d_target_points, num_target);
-
-        // Prepare chunk offsets
-        std::vector<int> h_chunk_offsets(num_chunks);
-        for (int i = 0; i < num_chunks; i++) {
-            h_chunk_offsets[i] = i * chunk_size;
+        // 포인트 복사 및 전처리
+        #pragma omp for schedule(dynamic)
+        for (size_t i = start_idx; i < end_idx; ++i) {
+            size_t local_idx = i - start_idx;
+            chunk.points[local_idx * 3] = source_cloud->points[i].x;
+            chunk.points[local_idx * 3 + 1] = source_cloud->points[i].y;
+            chunk.points[local_idx * 3 + 2] = source_cloud->points[i].z;
         }
-        cudaMemcpy(d_chunk_offsets, h_chunk_offsets.data(), num_chunks * sizeof(int), cudaMemcpyHostToDevice);
 
-        // Split source points into chunks
-        const int block_size = 256;
-        const int num_blocks = (num_source + block_size - 1) / block_size;
+        // 청크 큐에 추가
+        #pragma omp critical
+        {
+            chunk_queue.push(std::move(chunk));
+            queue_cv.notify_one();
+        }
+    }
+
+    // GPU 처리 스레드 시작
+    gpu_thread = std::thread([this]() {
+        processGPUChunks();
+    });
+}
+
+void CU_ICP::processGPUChunks() {
+    while (true) {
+        ChunkData chunk;
         
-        splitPointCloudKernel<<<num_blocks, block_size>>>(
-            d_source_points,
-            d_chunk_points,
-            d_chunk_offsets,
-            chunk_size,
-            num_source
-        );
-
-        // Process each chunk
-        for (int chunk = 0; chunk < num_chunks; chunk++) {
-            int chunk_points = (chunk == num_chunks - 1) ? 
-                             num_source - chunk * chunk_size : chunk_size;
-
-            float *d_chunk_source = d_chunk_points + chunk * chunk_size * 4;
-            float *d_chunk_transform = d_chunk_transforms + chunk * 16;
+        // 청크 큐에서 데이터 가져오기
+        {
+            std::unique_lock<std::mutex> lock(queue_mutex);
+            queue_cv.wait(lock, [this]() {
+                return !chunk_queue.empty() || processing_complete;
+            });
             
-            processChunk(d_chunk_source, d_target_points, chunk_points, num_target, d_chunk_transform);
-        }
-
-        // Average all transforms
-        float *d_final_transform;
-        cudaMalloc(&d_final_transform, 16 * sizeof(float));
-
-        averageTransformsKernel<<<1, 16>>>(
-            d_chunk_transforms,
-            d_final_transform,
-            num_chunks
-        );
-
-        // Copy final transform back to host
-        Eigen::Matrix4f final_transform;
-        cudaMemcpy(final_transform.data(), d_final_transform, 16 * sizeof(float), cudaMemcpyDeviceToHost);
-
-        // Cleanup
-        cudaFree(d_source_points);
-        cudaFree(d_target_points);
-        cudaFree(d_chunk_points);
-        cudaFree(d_chunk_offsets);
-        cudaFree(d_chunk_transforms);
-        cudaFree(d_final_transform);
-
-        return final_transform;
-    }
-
-private:
-    int max_iterations_;
-    float distance_threshold_;
-    int min_points_per_chunk_;
-    cusolverDnHandle_t cusolver_handle_;
-    float* d_temp_storage_;
-
-    void processChunk(float* d_chunk_source, float* d_target_points,
-                     int num_chunk_points, int num_target, float* d_chunk_transform) {
-        // Allocate chunk-specific memory
-        float *d_distances;
-        int *d_correspondences;
-        cudaMalloc(&d_distances, num_chunk_points * sizeof(float));
-        cudaMalloc(&d_correspondences, num_chunk_points * sizeof(int));
-
-        const int block_size = 256;
-        const int num_blocks = (num_chunk_points + block_size - 1) / block_size;
-
-        Eigen::Matrix4f transform = Eigen::Matrix4f::Identity();
-
-        for (int iter = 0; iter < max_iterations_; iter++) {
-            findNearestNeighborsKernel<<<num_blocks, block_size>>>(
-                d_chunk_source,
-                d_target_points,
-                d_correspondences,
-                d_distances,
-                num_chunk_points,
-                num_target
-            );
-
-            float *d_centroids, *d_covariance;
-            cudaMalloc(&d_centroids, 6 * sizeof(float));
-            cudaMalloc(&d_covariance, 9 * sizeof(float));
-            cudaMemset(d_centroids, 0, 6 * sizeof(float));
-            cudaMemset(d_covariance, 0, 9 * sizeof(float));
-
-            computeTransformationKernel<<<num_blocks, block_size>>>(
-                d_chunk_source,
-                d_target_points,
-                d_correspondences,
-                d_centroids,
-                d_covariance,
-                num_chunk_points
-            );
-
-            Eigen::Matrix4f iter_transform = computeTransformationMatrix(
-                d_centroids, d_covariance, num_chunk_points);
-
-            float *d_iter_transform;
-            cudaMalloc(&d_iter_transform, 16 * sizeof(float));
-            cudaMemcpy(d_iter_transform, iter_transform.data(), 16 * sizeof(float), cudaMemcpyHostToDevice);
-
-            transformPointsKernel<<<num_blocks, block_size>>>(
-                d_chunk_source,
-                d_iter_transform,
-                num_chunk_points
-            );
-
-            float error = computeError(d_distances, num_chunk_points);
-            
-            transform = iter_transform * transform;
-
-            if (error < distance_threshold_) break;
-
-            cudaFree(d_centroids);
-            cudaFree(d_covariance);
-            cudaFree(d_iter_transform);
-        }
-
-        // Copy final transform for this chunk
-        cudaMemcpy(d_chunk_transform, transform.data(), 16 * sizeof(float), cudaMemcpyHostToDevice);
-
-        // Cleanup chunk-specific memory
-        cudaFree(d_distances);
-        cudaFree(d_correspondences);
-    }
-
-    void copyPointCloudToDevice(
-        const pcl::PointCloud<pcl::PointXYZI>::Ptr& cloud,
-        float* d_points,
-        int num_points
-    ) {
-        std::vector<float> h_points(num_points * 4);
-        for (int i = 0; i < num_points; i++) {
-            h_points[i * 4] = cloud->points[i].x;
-            h_points[i * 4 + 1] = cloud->points[i].y;
-            h_points[i * 4 + 2] = cloud->points[i].z;
-            h_points[i * 4 + 3] = cloud->points[i].intensity;
-        }
-        cudaMemcpy(d_points, h_points.data(), num_points * 4 * sizeof(float), cudaMemcpyHostToDevice);
-    }
-
-    float computeError(float* d_distances, int num_points) {
-        const int block_size = 256;
-        const int num_blocks = (num_points + block_size * 2 - 1) / (block_size * 2);
-        
-        reduceSum<<<num_blocks, block_size, block_size * sizeof(float)>>>(
-            d_distances, d_temp_storage_, num_points);
-        
-        float total_error;
-        cudaMemcpy(&total_error, d_temp_storage_, sizeof(float), cudaMemcpyDeviceToHost);
-        
-        return total_error / num_points;
-    }
-
-    Eigen::Matrix4f computeTransformationMatrix(
-        float* d_centroids,
-        float* d_covariance,
-        int num_points
-    ) {
-        // Copy data back to host
-        float h_centroids[6];
-        float h_covariance[9];
-        cudaMemcpy(h_centroids, d_centroids, 6 * sizeof(float), cudaMemcpyDeviceToHost);
-        cudaMemcpy(h_covariance, d_covariance, 9 * sizeof(float), cudaMemcpyDeviceToHost);
-
-        // Compute centroids
-        Eigen::Vector3f source_centroid(
-            h_centroids[0] / num_points,
-            h_centroids[1] / num_points,
-            h_centroids[2] / num_points
-        );
-        Eigen::Vector3f target_centroid(
-            h_centroids[3] / num_points,
-            h_centroids[4] / num_points,
-            h_centroids[5] / num_points
-        );
-
-        // Compute covariance matrix
-        Eigen::Matrix3f covariance;
-        for (int i = 0; i < 3; i++) {
-            for (int j = 0; j < 3; j++) {
-                covariance(i, j) = h_covariance[i * 3 + j] / num_points -
-                    source_centroid[i] * target_centroid[j];
+            if (chunk_queue.empty() && processing_complete) {
+                break;
             }
+            
+            chunk = std::move(chunk_queue.front());
+            chunk_queue.pop();
         }
 
-        // Compute SVD
-        Eigen::JacobiSVD<Eigen::Matrix3f> svd(
-            covariance,
-            Eigen::ComputeFullU | Eigen::ComputeFullV
+        // 스트림 선택
+        int stream_idx = chunk.start_idx % HardwareParams::NUM_STREAMS;
+        StreamContext& ctx = stream_contexts[stream_idx];
+
+        // 비동기 메모리 전송
+        CUDA_CHECK(cudaMemcpyAsync(
+            ctx.device_buffer,
+            chunk.points.data(),
+            chunk.points.size() * sizeof(float),
+            cudaMemcpyHostToDevice,
+            ctx.stream
+        ));
+        CUDA_CHECK(cudaEventRecord(ctx.transfer_complete, ctx.stream));
+
+        // 커널 실행
+        const int threads_per_block = 256;
+        dim3 grid((chunk.num_points + threads_per_block - 1) / threads_per_block);
+        dim3 block(threads_per_block);
+
+        kernelNearestNeighborSearch<<<grid, block, 0, ctx.stream>>>(
+            ctx.device_buffer,
+            d_target_global,
+            ctx.d_correspondences,
+            chunk.num_points,
+            params.max_correspondence_distance
         );
 
-        // Compute rotation
-        Eigen::Matrix3f rotation = svd.matrixV() * svd.matrixU().transpose();
+        kernelComputeTransformation<<<grid, block, 0, ctx.stream>>>(
+            ctx.device_buffer,
+            ctx.d_correspondences,
+            ctx.d_transformation,
+            chunk.num_points
+        );
 
-        // Handle reflection case
-        if (rotation.determinant() < 0) {
-            Eigen::Matrix3f V = svd.matrixV();
-            V.col(2) *= -1;
-            rotation = V * svd.matrixU().transpose();
-        }
+        CUDA_CHECK(cudaEventRecord(ctx.compute_complete, ctx.stream));
 
-        // Compute translation
-        Eigen::Vector3f translation = target_centroid - rotation * source_centroid;
-
-        // Create transformation matrix
-        Eigen::Matrix4f transform = Eigen::Matrix4f::Identity();
-        transform.block<3, 3>(0, 0) = rotation;
-        transform.block<3, 1>(0, 3) = translation;
-
-        return transform;
+        // 결과 비동기 복사
+        CUDA_CHECK(cudaMemcpyAsync(
+            ((float*)source_cloud->points.data()) + chunk.start_idx * 3,
+            ctx.device_buffer,
+            chunk.num_points * sizeof(float) * 3,
+            cudaMemcpyDeviceToHost,
+            ctx.stream
+        ));
     }
-};
+
+    // 모든 스트림 동기화
+    for (auto& ctx : stream_contexts) {
+        CUDA_CHECK(cudaStreamSynchronize(ctx.stream));
+    }
+}
+
+void CU_ICP::align(pcl::PointCloud<pcl::PointXYZ>& output) {
+    // 결과 저장을 위한 메모리 할당
+    CUDA_CHECK(cudaMalloc(&d_result_global, 
+                         num_points * sizeof(float) * 3));
+    
+    for (int iter = 0; iter < params.max_iter; ++iter) {
+        processPointCloudAsync();
+        
+        // GPU 스레드 완료 대기
+        if (gpu_thread.joinable()) {
+            gpu_thread.join();
+        }
+        
+        // 수렴 검사
+        // ... 수렴 검사 로직 구현 ...
+    }
+    
+    // 최종 결과 복사
+    output.points.resize(num_points);
+    CUDA_CHECK(cudaMemcpy(output.points.data(),
+                         d_result_global,
+                         num_points * sizeof(float) * 3,
+                         cudaMemcpyDeviceToHost));
+    
+    // 결과 메모리 해제
+    CUDA_CHECK(cudaFree(d_result_global));
+}
+
+void CU_ICP::checkCudaErrors(cudaError_t error, const char* file, int line) {
+    if (error != cudaSuccess) {
+        fprintf(stderr, "CUDA error at %s:%d: %s\n", 
+                file, line, cudaGetErrorString(error));
+        exit(EXIT_FAILURE);
+    }
+}
+
+int main(){
+    CU_ICP cu_icp;
+
+    pcl::PointCloud<pcl::PointXYZ>::Ptr source(new pcl::PointCloud<pcl::PointXYZ>);
+    pcl::PointCloud<pcl::PointXYZ>::Ptr target(new pcl::PointCloud<pcl::PointXYZ>);
+
+
+    
+    cu_icp.setInputSource(source);
+    cu_icp.setInputTarget(target);
+    cu_icp.align(*source);
+
+    return 0;
+}

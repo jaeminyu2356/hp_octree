@@ -1,6 +1,7 @@
 #include "get_pcd.hpp"
 #include "serial_icp.hpp"
 #include "parallel_icp.hpp"
+#include "cu_icp.cuh"
 #include <stdio.h>
 #include <pcl/visualization/pcl_visualizer.h>
 #include <thread>

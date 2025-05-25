@@ -1,0 +1,2 @@
+/usr/bin/ar qc libcu_icp_kernels.a CMakeFiles/cu_icp_kernels.dir/src/cu_icp_kernels.cu.o
+/usr/bin/ranlib libcu_icp_kernels.a
